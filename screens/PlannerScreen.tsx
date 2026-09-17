@@ -256,13 +256,15 @@ export function PlannerScreen() {
     if (!q || chatBusy) return;
     setChatBusy(true);
     setChatInput('');
+    const history: { role: 'user' | 'assistant'; content: string }[] =
+      chat.map((c) => ({ role: c.from === 'you' ? 'user' : 'assistant', content: c.text }));
     setChat((prev) => [...prev.slice(-8), { from: 'you', text: q }]);
-    const res = await askAssistant(q);
+    const res = await askAssistant(q, history);
     setChat((prev) => [...prev.slice(-8), { from: 'planner', text: res.reply }]);
     setChatBusy(false);
     if (res.changed) afterMutation();
     setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 120);
-  }, [chatInput, chatBusy, afterMutation]);
+  }, [chat, chatInput, chatBusy, afterMutation]);
 
   // ── Derived data ────────────────────────────────────────────────────────────
 

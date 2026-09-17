@@ -6,16 +6,19 @@ import {
 import { useFocusEffect } from '@react-navigation/native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import Svg, { Path, Line, Circle } from 'react-native-svg';
-import { COLORS, FONTS, FONT_SIZE, SPACING, RADII } from '../../theme';
+import { COLORS, FONTS, FONT_SIZE, SPACING, RADII, getScoreColor, getScoreState } from '../../theme';
 import { AppIcon, SunriseIcon, DumbbellIcon, DropletIcon, LotusIcon } from '../../components/icons';
+import { GlassCard } from '../../components/GlassCard';
 import { GlassSheet } from '../../components/GlassSheet';
+import { fmtDuration } from '../../services/calendar';
 
 const ICON_CHOICES = [
   'scale', 'dumbbell', 'droplet', 'moon', 'lotus', 'bolt',
   'flame', 'runner', 'brain', 'pen', 'coffee', 'bowl', 'signal', 'wallet',
 ];
 import {
-  KEYS, formatDateKey, getSettings,
+  KEYS, formatDateKey, getSettings, getLast7DayKeys, calcScore, countRoutineHitsAndSkips,
+  getRoutineConfig, getRoutineStates, getRoutineCompletionTimes,
   GrowthGoal, getGrowthGoals, saveGrowthGoals, DEFAULT_GROWTH_GOALS,
   type WorkoutSession,
 } from '../../services/storage';
@@ -414,6 +417,186 @@ const milestoneStyles = StyleSheet.create({
   sub: { fontSize: 8, color: COLORS.textMuted, fontFamily: FONTS.mono ?? undefined, letterSpacing: 0.5 },
 });
 
+// ─── Daily verdict + insights ──────────────────────────────────────────────────
+// Moved here from the former Coach tab, now that section is Vitalis AI's own
+// full chat screen — this is the rule-based half (instant, free, no LLM call)
+// that used to sit alongside it; the AI still reads all of this same data as
+// context for every answer, it just isn't rendered as separate cards there.
+
+interface Insight { id: string; category: string; title: string; body: string; severity: 'info' | 'warn' | 'alert'; emoji: string }
+interface Breakdown { label: string; value: number; color: string }
+
+function buildInsights(
+  avgHydration: number, waterGoal: number,
+  avgSteps: number, stepGoal: number,
+  streak: number, avgScore: number,
+  avgRoutineHits: number, totalRoutines: number,
+  avgSleep: number,
+): Insight[] {
+  const insights: Insight[] = [];
+  const avgLitres = (avgHydration * 0.25).toFixed(1);
+  const goalLitres = (waterGoal * 0.25).toFixed(1);
+
+  if (avgHydration >= waterGoal * 0.75)
+    insights.push({ id: 'hyd', category: 'HYDRATION', title: 'Hydration on target', body: `Averaging ${avgLitres}L over 7 days — within the optimal window. Keep front-loading in the morning.`, severity: 'info', emoji: 'droplet' });
+  else if (avgHydration >= waterGoal * 0.4)
+    insights.push({ id: 'hyd', category: 'HYDRATION', title: 'Hydration below target', body: `Averaging ${avgLitres}L over 7 days — below your ${goalLitres}L goal. Use Quick Capture to log each glass.`, severity: 'warn', emoji: 'droplet' });
+  else
+    insights.push({ id: 'hyd', category: 'HYDRATION', title: 'Critical hydration deficit', body: `Averaging only ${avgLitres}L per day. Start tomorrow with 500ml before any caffeine.`, severity: 'alert', emoji: 'droplet' });
+
+  const stepsK = Math.round(avgSteps / 100) / 10;
+  if (avgSteps >= stepGoal * 0.8)
+    insights.push({ id: 'mov', category: 'MOVEMENT', title: 'Strong daily movement', body: `${stepsK}K avg daily steps. Add a brief evening walk to hit your ${(stepGoal / 1000).toFixed(0)}K goal.`, severity: 'info', emoji: 'runner' });
+  else if (avgSteps >= stepGoal * 0.3)
+    insights.push({ id: 'mov', category: 'MOVEMENT', title: 'Movement needs boosting', body: `${stepsK}K avg daily steps — below your ${(stepGoal / 1000).toFixed(0)}K goal. A 20-minute walk adds ~2,000 steps.`, severity: 'warn', emoji: 'runner' });
+  else
+    insights.push({ id: 'mov', category: 'MOVEMENT', title: 'Low movement detected', body: `Only ${stepsK}K steps on average. Try a movement alarm at 10:00 and 15:00.`, severity: 'alert', emoji: 'runner' });
+
+  if (streak >= 7)
+    insights.push({ id: 'str', category: 'CONSISTENCY', title: `${streak}-day streak — exceptional`, body: 'You have shown up every day this week. Protect this streak by completing at least one routine before noon.', severity: 'info', emoji: 'flame' });
+  else if (streak >= 3)
+    insights.push({ id: 'str', category: 'CONSISTENCY', title: `${streak}-day streak running`, body: 'Solid momentum. Push through to 7 days.', severity: 'info', emoji: 'flame' });
+  else
+    insights.push({ id: 'str', category: 'CONSISTENCY', title: 'Build your streak', body: 'Complete at least one routine per day to start a streak.', severity: 'warn', emoji: 'flame' });
+
+  if (totalRoutines > 0) {
+    const hitPct = Math.round((avgRoutineHits / totalRoutines) * 100);
+    if (hitPct >= 70)
+      insights.push({ id: 'rtn', category: 'ROUTINES', title: 'Routine adherence solid', body: `Hitting ${hitPct}% of routines on average. Identify the one you miss most and anchor it to an existing habit.`, severity: 'info', emoji: 'bolt' });
+    else if (hitPct >= 30)
+      insights.push({ id: 'rtn', category: 'ROUTINES', title: 'Routine completion needs work', body: `Only ${hitPct}% adherence. Focus on your top 3 must-hit routines tomorrow.`, severity: 'warn', emoji: 'bolt' });
+    else
+      insights.push({ id: 'rtn', category: 'ROUTINES', title: 'Routines largely unmeasured', body: 'Start by marking Morning Anchors each day — even logging misses builds awareness.', severity: 'alert', emoji: 'bolt' });
+  }
+
+  if (avgSleep > 0) {
+    if (avgSleep >= 7.5)
+      insights.push({ id: 'slp', category: 'SLEEP', title: 'Sleep quality optimal', body: `Averaging ${avgSleep.toFixed(1)}h over logged nights — within the restorative range.`, severity: 'info', emoji: 'moon' });
+    else if (avgSleep >= 6.0)
+      insights.push({ id: 'slp', category: 'SLEEP', title: 'Sleep below optimal', body: `Averaging ${avgSleep.toFixed(1)}h. Aim for 7.5h — even 30 extra minutes improves recovery significantly.`, severity: 'warn', emoji: 'moon' });
+    else
+      insights.push({ id: 'slp', category: 'SLEEP', title: 'Critical sleep deficit', body: `Averaging only ${avgSleep.toFixed(1)}h. Prioritise sleep before optimising any other metric.`, severity: 'alert', emoji: 'moon' });
+  }
+
+  return insights;
+}
+
+/**
+ * Reads how far off each completed routine's real check-off time landed from
+ * its planned preferredTime — flags the day actually slipping, not just
+ * whether each routine happened.
+ */
+function buildTimingInsight(
+  timedCount: number,
+  lateItems: { label: string; lateBy: number }[],
+  totalLostMinutes: number,
+): Insight | null {
+  if (timedCount === 0) return null;
+
+  if (lateItems.length === 0) {
+    return {
+      id: 'tim', category: 'TIMING', title: 'Running on schedule',
+      body: 'Every routine checked off today landed close to its planned time.',
+      severity: 'info', emoji: 'bell',
+    };
+  }
+
+  const worst = lateItems.reduce((a, b) => (b.lateBy > a.lateBy ? b : a));
+  const severity: 'warn' | 'alert' = totalLostMinutes < 60 ? 'warn' : 'alert';
+  return {
+    id: 'tim', category: 'TIMING', title: `${fmtDuration(totalLostMinutes)} behind schedule today`,
+    body: severity === 'warn'
+      ? `${worst.label} happened ${fmtDuration(worst.lateBy)} later than planned. Small slips like this push everything else back — try anchoring it to something that already happens on time.`
+      : `${worst.label} alone slipped ${fmtDuration(worst.lateBy)} from its planned time. That's enough drift to reshape the rest of the day — worth resetting its planned time if this keeps happening.`,
+    severity, emoji: 'bell',
+  };
+}
+
+function VerdictCard({ score, breakdown }: { score: number; breakdown: Breakdown[] }) {
+  const state = getScoreState(score);
+  const color = getScoreColor(score);
+  const verdict =
+    state === 'optimal' ? { title: 'SYSTEM OPTIMAL',  sub: 'All primary vitals within target range.', iconId: 'check-circle' } :
+    state === 'warning' ? { title: 'ATTENTION NEEDED', sub: 'One or more metrics below threshold.', iconId: 'warning' } :
+                          { title: 'CRITICAL STATE',   sub: 'Multiple systems require immediate correction.', iconId: 'alert-circle' };
+
+  return (
+    <GlassCard>
+      <View style={verdictStyles.topRow}>
+        <AppIcon id={verdict.iconId} size={26} color={color} />
+        <View style={verdictStyles.verdictText}>
+          <Text style={[verdictStyles.title, { color }]}>{verdict.title}</Text>
+          <Text style={verdictStyles.sub}>{verdict.sub}</Text>
+        </View>
+        <View style={[verdictStyles.stateBadge, { borderColor: color }]}>
+          <Text style={[verdictStyles.stateBadgeText, { color }]}>{state.toUpperCase()}</Text>
+        </View>
+      </View>
+      <View style={verdictStyles.breakdown}>
+        {breakdown.map((item) => (
+          <View key={item.label} style={verdictStyles.breakdownItem}>
+            <Text style={[verdictStyles.breakdownVal, { color: item.color }]}>{item.value}</Text>
+            <Text style={verdictStyles.breakdownLabel}>{item.label}</Text>
+            <View style={verdictStyles.miniBarTrack}>
+              <View style={[verdictStyles.miniBarFill, { width: `${item.value}%` as any, backgroundColor: item.color }]} />
+            </View>
+          </View>
+        ))}
+      </View>
+    </GlassCard>
+  );
+}
+
+const verdictStyles = StyleSheet.create({
+  topRow: { flexDirection: 'row', alignItems: 'center', gap: SPACING.sm, marginBottom: SPACING.lg },
+  verdictText: { flex: 1, gap: 2 },
+  title: { fontSize: FONT_SIZE.lg, fontFamily: FONTS.heading ?? undefined, fontWeight: '700', letterSpacing: 1 },
+  sub: { fontSize: FONT_SIZE.sm, color: COLORS.textSecondary, fontFamily: FONTS.body ?? undefined },
+  stateBadge: { borderWidth: 1, borderRadius: RADII.sm, paddingHorizontal: SPACING.sm, paddingVertical: SPACING.xs },
+  stateBadgeText: { fontSize: FONT_SIZE.xxs, fontFamily: FONTS.mono ?? undefined, fontWeight: '700', letterSpacing: 1.5 },
+  breakdown: { flexDirection: 'row', gap: SPACING.sm },
+  breakdownItem: { flex: 1, alignItems: 'center', gap: SPACING.xxs },
+  breakdownVal: { fontSize: FONT_SIZE.xl, fontFamily: FONTS.heading ?? undefined, fontWeight: '700' },
+  breakdownLabel: { fontSize: 8, color: COLORS.textMuted, fontFamily: FONTS.mono ?? undefined, letterSpacing: 1 },
+  miniBarTrack: { width: '100%', height: 2, backgroundColor: COLORS.borderNeon, borderRadius: RADII.full, overflow: 'hidden' },
+  miniBarFill: { height: '100%', borderRadius: RADII.full },
+});
+
+function InsightCard({ insight }: { insight: Insight }) {
+  const color = insight.severity === 'info' ? COLORS.textSecondary : insight.severity === 'warn' ? COLORS.amber : COLORS.red;
+  return (
+    <View style={insightStyles.card}>
+      <View style={[insightStyles.severityBar, { backgroundColor: color }]} />
+      <View style={insightStyles.content}>
+        <View style={insightStyles.catRow}>
+          <AppIcon id={insight.emoji} size={14} color={color} />
+          <Text style={[insightStyles.category, { color }]}>{insight.category}</Text>
+        </View>
+        <Text style={insightStyles.title}>{insight.title}</Text>
+        <Text style={insightStyles.body}>{insight.body}</Text>
+      </View>
+    </View>
+  );
+}
+
+const insightStyles = StyleSheet.create({
+  card: {
+    flexDirection: 'row',
+    marginBottom: SPACING.sm,
+    backgroundColor: COLORS.surfaceSolid,
+    borderRadius: RADII.md,
+    borderWidth: 1,
+    borderColor: COLORS.borderDim,
+    overflow: 'hidden',
+  },
+  severityBar: { width: 2, margin: SPACING.xs, borderRadius: 1, opacity: 0.8 },
+  content: { flex: 1, padding: SPACING.md, gap: SPACING.xs },
+  catRow: { flexDirection: 'row', alignItems: 'center', gap: SPACING.xs },
+  category: { fontSize: FONT_SIZE.xxs, fontFamily: FONTS.mono ?? undefined, letterSpacing: 2, fontWeight: '700' },
+  title: { fontSize: FONT_SIZE.base, color: COLORS.textPrimary, fontFamily: FONTS.bodySemi ?? undefined, fontWeight: '600' },
+  body: { fontSize: FONT_SIZE.sm, color: COLORS.textSecondary, fontFamily: FONTS.body ?? undefined, lineHeight: FONT_SIZE.sm * 1.5 },
+});
+
 // ─── GoalsSection ─────────────────────────────────────────────────────────────
 
 type CurrentValues = Record<string, number>;
@@ -440,6 +623,9 @@ export function GoalsSection() {
   const [hydrationMilestone, setHydrationMilestone] = useState<MilestoneResult | null>(null);
   const [zenMilestone, setZenMilestone]           = useState<MilestoneResult | null>(null);
   const [milestonesExpanded, setMilestonesExpanded] = useState(false);
+  const [overallScore, setOverallScore]   = useState(0);
+  const [breakdown, setBreakdown]         = useState<Breakdown[]>([]);
+  const [insights, setInsights]           = useState<Insight[]>([]);
 
   useFocusEffect(
     useCallback(() => {
@@ -447,12 +633,13 @@ export function GoalsSection() {
       const load = async () => {
         try {
           const now = new Date();
-          const [loadedGoals, settings, allKeys, weightPairs, streakRaw] = await Promise.all([
+          const [loadedGoals, settings, allKeys, weightPairs, streakRaw, routineConfig] = await Promise.all([
             getGrowthGoals(),
             getSettings(),
             AsyncStorage.getAllKeys(),
             AsyncStorage.multiGet([KEYS.weightStart, KEYS.weight]),
             AsyncStorage.getItem(KEYS.streak),
+            getRoutineConfig(),
           ]);
 
           if (!active) return;
@@ -620,6 +807,67 @@ export function GoalsSection() {
             ? Math.round(loadedGoals.reduce((sum, g) => sum + Math.min((cv[g.id] ?? 0) / Math.max(g.target, 1), 1), 0) / loadedGoals.length * 100)
             : 0;
           setQuarterPct(overallAvg);
+
+          // ── Daily verdict + insights (moved from the old Coach tab) ────────
+          const totalRoutinesEnabled = routineConfig.filter((r) => r.enabled !== false).length;
+          const dayKeys = getLast7DayKeys();
+          const dailyData = await Promise.all(dayKeys.map(async (dk) => {
+            const [routRaw, waterRaw, stepsRaw, sleepRaw] = await Promise.all([
+              AsyncStorage.getItem(KEYS.routines(dk)),
+              AsyncStorage.getItem(KEYS.water(dk)),
+              AsyncStorage.getItem(KEYS.steps(dk)),
+              AsyncStorage.getItem(KEYS.sleep(dk)),
+            ]);
+            const routineStates: Record<string, string> = routRaw ? JSON.parse(routRaw) : {};
+            const waterVal = waterRaw ? parseInt(waterRaw, 10) : 0;
+            const stepsVal = stepsRaw ? parseInt(stepsRaw, 10) : 0;
+            const sleepVal = sleepRaw ? parseFloat(sleepRaw) : 0;
+            const { hits, skipped } = countRoutineHitsAndSkips(routineStates);
+            const dayScore = calcScore(hits, totalRoutinesEnabled - skipped, waterVal, settings.waterGoal, stepsVal, settings.stepGoal, sleepVal, settings.sleepGoalHours);
+            return { dateKey: dk, score: dayScore, water: waterVal, steps: stepsVal, sleep: sleepVal, hits };
+          }));
+
+          const todayVerdictData = dailyData[dailyData.length - 1];
+          const avgWaterWk = dailyData.reduce((s, d) => s + d.water, 0) / 7;
+          const avgStepsWk = dailyData.reduce((s, d) => s + d.steps, 0) / 7;
+          const avgHitsWk  = dailyData.reduce((s, d) => s + d.hits, 0)  / 7;
+          const avgScoreWk = dailyData.reduce((s, d) => s + d.score, 0) / 7;
+          const sleepDaysWk = dailyData.filter((d) => d.sleep > 0);
+          const avgSleepWk = sleepDaysWk.length ? sleepDaysWk.reduce((s, d) => s + d.sleep, 0) / sleepDaysWk.length : 0;
+
+          const todayHitsVerdict = todayVerdictData.hits;
+          const bd: Breakdown[] = [
+            { label: 'ROUTINES',  value: totalRoutinesEnabled > 0 ? Math.min(Math.round((todayHitsVerdict / totalRoutinesEnabled) * 100), 100) : 0, color: COLORS.textSecondary },
+            { label: 'HYDRATION', value: Math.min(Math.round((todayVerdictData.water / settings.waterGoal) * 100), 100),                            color: COLORS.textSecondary },
+            { label: 'MOVEMENT',  value: Math.min(Math.round((todayVerdictData.steps / settings.stepGoal) * 100), 100),                             color: COLORS.textSecondary },
+            { label: 'STREAK',    value: Math.min(Math.round((streakVal / 30) * 100), 100),                                                          color: COLORS.amber },
+          ];
+
+          const todayKey = dayKeys[dayKeys.length - 1];
+          const [todayStates, todayTimes] = await Promise.all([
+            getRoutineStates(todayKey),
+            getRoutineCompletionTimes(todayKey),
+          ]);
+          const timedToday = routineConfig
+            .filter((r) => r.enabled !== false && r.preferredTime !== undefined)
+            .map((r) => {
+              if (todayStates[r.id] !== 'hit') return null;
+              const iso = todayTimes[r.id];
+              if (!iso) return null;
+              const completedDate = new Date(iso);
+              if (formatDateKey(completedDate) !== todayKey) return null;
+              const completedAtMinutes = completedDate.getHours() * 60 + completedDate.getMinutes();
+              return { label: r.label, lateBy: completedAtMinutes - r.preferredTime! };
+            })
+            .filter((x): x is { label: string; lateBy: number } => x !== null);
+          const lateToday = timedToday.filter((x) => x.lateBy > 15);
+          const totalLostMinutes = lateToday.reduce((s, x) => s + x.lateBy, 0);
+          const timingInsight = buildTimingInsight(timedToday.length, lateToday, totalLostMinutes);
+
+          setOverallScore(todayVerdictData.score);
+          setBreakdown(bd);
+          const baseInsights = buildInsights(avgWaterWk, settings.waterGoal, avgStepsWk, settings.stepGoal, streakVal, avgScoreWk, avgHitsWk, totalRoutinesEnabled, avgSleepWk);
+          setInsights(timingInsight ? [...baseInsights, timingInsight] : baseInsights);
         } catch (_) {}
       };
       load();
@@ -738,6 +986,18 @@ export function GoalsSection() {
         </TouchableOpacity>
       </View>
 
+      {/* Daily verdict + insights — moved here from the old Coach tab */}
+      <View style={s.sectionRow}>
+        <Text style={s.sectionTitle}>Daily System Verdict</Text>
+      </View>
+      <VerdictCard score={overallScore} breakdown={breakdown} />
+
+      <View style={s.sectionRow}>
+        <Text style={s.sectionTitle}>Active Insights</Text>
+        <Text style={s.insightCount}>{insights.length} FINDINGS</Text>
+      </View>
+      {insights.map((i) => <InsightCard key={i.id} insight={i} />)}
+
       <View style={{ height: SPACING.xxl }} />
 
       <GoalEditModal
@@ -776,6 +1036,7 @@ const s = StyleSheet.create({
   sectionRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginTop: SPACING.sm, marginBottom: SPACING.sm },
   sectionTitle: { fontSize: FONT_SIZE.md, color: COLORS.textPrimary, fontFamily: FONTS.heading ?? undefined, fontWeight: '700' },
   trendIcon: { fontSize: FONT_SIZE.md, color: COLORS.textMuted },
+  insightCount: { fontSize: FONT_SIZE.xxs, color: COLORS.textMuted, fontFamily: FONTS.mono ?? undefined, letterSpacing: 1 },
   wowText: { fontSize: 9, color: COLORS.textSecondary, fontFamily: FONTS.mono ?? undefined, letterSpacing: 0.5, fontWeight: '700' },
   viewAllLink: { fontSize: FONT_SIZE.xs, color: COLORS.textMuted, fontFamily: FONTS.mono ?? undefined, letterSpacing: 0.5 },
 

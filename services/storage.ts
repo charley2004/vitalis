@@ -16,12 +16,25 @@ export function getYesterdayKey(): string {
   return formatDateKey(d);
 }
 
-export function getLast7DayKeys(): string[] {
-  return Array.from({ length: 7 }, (_, i) => {
+export function getLastNDayKeys(n: number): string[] {
+  return Array.from({ length: n }, (_, i) => {
     const d = new Date();
-    d.setDate(d.getDate() - (6 - i));
+    d.setDate(d.getDate() - (n - 1 - i));
     return formatDateKey(d);
   });
+}
+
+export function getLast7DayKeys(): string[] {
+  return getLastNDayKeys(7);
+}
+
+/** Date-key of the most recent Sunday — stable across a whole week, changes
+ *  only when the week rolls over. Used to gate the weekly review to once a
+ *  week without needing a server-side cron. */
+export function getWeekKey(): string {
+  const d = new Date();
+  d.setDate(d.getDate() - d.getDay());
+  return formatDateKey(d);
 }
 
 export function getDayAbbr(dateKey: string): string {
@@ -43,6 +56,11 @@ export function getLastNMonthKeys(n: number): { key: string; label: string }[] {
 export const KEYS = {
   routines:       (date: string) => `@vitalis/routines_${date}`,
   routineTimes:   (date: string) => `@vitalis/routine_times_${date}`,
+  routineTimeOverrides: (date: string) => `@vitalis/routine_time_overrides_${date}`,
+  morningDigest:  (date: string) => `@vitalis/morning_digest_${date}`,
+  snoozeCounts:   (date: string) => `@vitalis/snooze_counts_${date}`,
+  weeklyReview:     '@vitalis/weekly_review',
+  weeklyReviewWeek: '@vitalis/weekly_review_week',
   water:          (date: string) => `@vitalis/water_${date}`,
   steps:          (date: string) => `@vitalis/steps_${date}`,
   sleep:          (date: string) => `@vitalis/sleep_${date}`,
@@ -63,6 +81,8 @@ export const KEYS = {
   financeGoals: '@vitalis/finance_goals',
   financeCalcHistory: '@vitalis/finance_calc_history',
   financeSettings: '@vitalis/finance_settings',
+  fitnessGoal: '@vitalis/fitness_goal',
+  fitnessProgram: '@vitalis/fitness_program',
 };
 
 // ─── Settings ─────────────────────────────────────────────────────────────────
@@ -245,6 +265,21 @@ export async function setRoutineHit(dateKey: string, routineId: string, hit: boo
   }
 }
 
+/** +1 glass for a date — the same write TodayScreen's water chip makes,
+ *  factored out so the "Mark Done" notification action (App.tsx, no local
+ *  screen state to update) can log a glass without duplicating the read
+ *  parse-increment-write. Returns the new total. */
+export async function addWaterGlass(dateKey: string): Promise<number> {
+  try {
+    const raw = await AsyncStorage.getItem(KEYS.water(dateKey));
+    const updated = (raw ? parseInt(raw, 10) : 0) + 1;
+    await AsyncStorage.setItem(KEYS.water(dateKey), String(updated));
+    return updated;
+  } catch {
+    return 0;
+  }
+}
+
 /**
  * Marks a routine intentionally skipped for a date — for something you
  * genuinely couldn't get to (travel, illness, a schedule conflict), so it
@@ -262,6 +297,60 @@ export async function setRoutineSkipped(dateKey: string, routineId: string, skip
   if (times[routineId]) {
     delete times[routineId];
     await AsyncStorage.setItem(KEYS.routineTimes(dateKey), JSON.stringify(times));
+  }
+}
+
+/**
+ * Per-date time overrides — "just today" reschedules (e.g. Vitalis AI's
+ * "reset my day" after waking up late) without touching the permanent daily
+ * preferredTime on RoutineDefinition. Tomorrow reverts automatically since
+ * there's simply no override stored for that date. Minutes since midnight,
+ * same units as preferredTime; a routineId with no entry uses its normal time.
+ */
+export async function getRoutineTimeOverrides(dateKey: string): Promise<Record<string, number>> {
+  try {
+    const raw = await AsyncStorage.getItem(KEYS.routineTimeOverrides(dateKey));
+    return raw ? JSON.parse(raw) : {};
+  } catch { return {}; }
+}
+
+export async function setRoutineTimeOverride(dateKey: string, routineId: string, minutes: number | null): Promise<void> {
+  const overrides = await getRoutineTimeOverrides(dateKey);
+  if (minutes === null) delete overrides[routineId];
+  else overrides[routineId] = minutes;
+  await AsyncStorage.setItem(KEYS.routineTimeOverrides(dateKey), JSON.stringify(overrides));
+}
+
+/** The time to actually use for a routine on a given date — its override
+ *  for that date if one exists, otherwise its normal preferredTime. */
+export function effectivePreferredTime(routine: RoutineDefinition, overrides: Record<string, number>): number | undefined {
+  return overrides[routine.id] ?? routine.preferredTime;
+}
+
+/** How many times a given task has been snoozed today, keyed by a stable
+ *  composite id (e.g. `routine:${routineId}` or `planner:${eventId}:${dateKey}`)
+ *  since routine/planner reminders don't otherwise have a single persistent
+ *  row to attach a counter to. Backs the Snooze cap/escalation in
+ *  services/reminders.ts. */
+export async function getSnoozeCount(dateKey: string, taskKey: string): Promise<number> {
+  try {
+    const raw = await AsyncStorage.getItem(KEYS.snoozeCounts(dateKey));
+    const counts: Record<string, number> = raw ? JSON.parse(raw) : {};
+    return counts[taskKey] ?? 0;
+  } catch {
+    return 0;
+  }
+}
+
+export async function incrementSnoozeCount(dateKey: string, taskKey: string): Promise<number> {
+  try {
+    const raw = await AsyncStorage.getItem(KEYS.snoozeCounts(dateKey));
+    const counts: Record<string, number> = raw ? JSON.parse(raw) : {};
+    counts[taskKey] = (counts[taskKey] ?? 0) + 1;
+    await AsyncStorage.setItem(KEYS.snoozeCounts(dateKey), JSON.stringify(counts));
+    return counts[taskKey];
+  } catch {
+    return 0;
   }
 }
 
@@ -311,12 +400,19 @@ export async function saveGrowthGoals(goals: GrowthGoal[]): Promise<void> {
 
 // ─── Workout session ──────────────────────────────────────────────────────────
 
+export interface SetLog { weightKg: number; reps: number; }
+export interface LoggedExercise { exerciseId: string; sets: SetLog[]; feltTooHeavy?: boolean; }
+
 export interface WorkoutSession {
   date: string;
   durationMinutes: number;
   exerciseIds: string[];
   completedIds: string[];
   category: 'upper' | 'lower' | 'cardio' | 'full';
+  /** Actual weight/reps performed, present only when this session followed
+   *  an active FitnessProgram (services/fitness.ts). Optional and additive
+   *  so ad-hoc, program-less workouts are unaffected. */
+  loggedExercises?: LoggedExercise[];
 }
 
 export async function saveWorkoutSession(session: WorkoutSession): Promise<void> {

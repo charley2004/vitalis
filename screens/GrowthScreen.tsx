@@ -11,14 +11,15 @@ type GrowthTab = 'goals' | 'coach';
 
 const TABS: { id: GrowthTab; label: string }[] = [
   { id: 'goals', label: 'GOALS' },
-  { id: 'coach', label: 'COACH' },
+  { id: 'coach', label: 'VITALIS AI' },
 ];
 
 // Coach used to be its own bottom tab — merged in here since both screens
 // exist to answer "how am I actually doing," just at different time
 // horizons (quarter-long targets vs. day-to-day verdict/chat). Splitting
 // them across tabs meant comparing them manually; a pill switcher keeps
-// them adjacent instead.
+// them adjacent instead. The tab id stays 'coach' internally (services/coach.ts
+// etc. are unchanged) — only the user-facing name became Vitalis AI.
 export function GrowthScreen() {
   const navigation = useNavigation();
   const [tab, setTab] = useState<GrowthTab>('goals');

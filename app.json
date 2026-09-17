@@ -8,7 +8,11 @@
     "userInterfaceStyle": "dark",
     "backgroundColor": "#0A0A0A",
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSSpeechRecognitionUsageDescription": "Vitalis uses speech recognition to transcribe your voice input to Vitalis AI.",
+        "NSMicrophoneUsageDescription": "Vitalis uses your microphone for voice input to Vitalis AI."
+      }
     },
     "android": {
       "package": "com.vitalis.app",
@@ -17,7 +21,13 @@
         "foregroundImage": "./assets/android-icon-foreground.png",
         "monochromeImage": "./assets/android-icon-monochrome.png"
       },
-      "predictiveBackGestureEnabled": false
+      "predictiveBackGestureEnabled": false,
+      "permissions": [
+        "android.permission.RECORD_AUDIO",
+        "android.permission.USE_BIOMETRIC",
+        "android.permission.USE_FINGERPRINT",
+        "android.permission.MODIFY_AUDIO_SETTINGS"
+      ]
     },
     "web": {
       "favicon": "./assets/favicon.png"
@@ -59,12 +69,26 @@
           "faceIDPermission": "Vitalis uses Face ID to unlock the Finance module."
         }
       ],
-      "expo-audio"
+      "expo-audio",
+      [
+        "expo-speech-recognition",
+        {
+          "microphonePermission": "Vitalis uses your microphone for voice input to Vitalis AI.",
+          "speechRecognitionPermission": "Vitalis uses speech recognition to transcribe your voice input to Vitalis AI."
+        }
+      ],
+      "expo-task-manager"
     ],
     "extra": {
       "eas": {
         "projectId": "0d0ca4aa-9ae1-427e-8704-dcfdb803065d"
       }
+    },
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/0d0ca4aa-9ae1-427e-8704-dcfdb803065d"
     }
   }
 }

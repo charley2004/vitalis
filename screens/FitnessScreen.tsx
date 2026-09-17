@@ -5,6 +5,9 @@ import {
   ScrollView,
   TouchableOpacity,
   StyleSheet,
+  TextInput,
+  ActivityIndicator,
+  Alert,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useFocusEffect, useNavigation } from '@react-navigation/native';
@@ -13,7 +16,12 @@ import Svg, { Circle } from 'react-native-svg';
 import { COLORS, FONTS, FONT_SIZE, SPACING, RADII } from '../theme';
 import { BoltIcon, CheckCircleIcon } from '../components/icons';
 import { WorkoutModal, type CompletedSession } from './WorkoutModal';
-import { KEYS, saveWorkoutSession, getWorkoutSession, getSettings, DEFAULT_SETTINGS, type WorkoutSession } from '../services/storage';
+import { KEYS, saveWorkoutSession, getWorkoutSession, getSettings, DEFAULT_SETTINGS, type WorkoutSession, type LoggedExercise } from '../services/storage';
+import { askCoach } from '../services/coach';
+import {
+  getFitnessGoal, getFitnessProgram, getSplitDayFor, suggestNextWeight, applyWeightChange,
+  type FitnessGoal, type FitnessProgram, type ProgramExercise,
+} from '../services/fitness';
 
 function getTodayKey(): string {
   const d = new Date();
@@ -42,6 +50,30 @@ const CATEGORY_LABEL: Record<CompletedSession['category'], string> = {
 };
 
 const WEEKS_PER_YEAR = 52;
+
+/** Walks logged exercises one at a time, offering the deterministic
+ *  suggestNextWeight() verdict as a plain confirm — never applies anything
+ *  without the user choosing to. A "hold" suggestion needs no decision, so
+ *  it's skipped silently rather than adding an Alert nobody needs to see. */
+function presentWeightSuggestions(
+  remaining: { exercise: ProgramExercise; log: LoggedExercise }[],
+  onDone: () => void,
+) {
+  if (remaining.length === 0) { onDone(); return; }
+  const [{ exercise, log }, ...rest] = remaining;
+  const advance = () => presentWeightSuggestions(rest, onDone);
+  const suggestion = suggestNextWeight(exercise, log);
+
+  if (suggestion.direction === 'hold') { advance(); return; }
+
+  Alert.alert(exercise.name, suggestion.reason, [
+    { text: 'Keep current weight', style: 'cancel', onPress: advance },
+    {
+      text: `${suggestion.direction === 'up' ? 'Move to' : 'Back off to'} ${suggestion.suggestedKg}kg`,
+      onPress: async () => { await applyWeightChange(exercise.exerciseId, suggestion.suggestedKg); advance(); },
+    },
+  ]);
+}
 
 // ─── Weekly training ring ─────────────────────────────────────────────────────
 
@@ -80,7 +112,16 @@ export function FitnessScreen() {
   const [lastSession, setLastSession]     = useState<{ session: WorkoutSession; dateKey: string } | null>(null);
   const [history, setHistory]             = useState<HistoryEntry[]>([]);
   const [showModal, setShowModal]         = useState(false);
+  const [launchWithProgram, setLaunchWithProgram] = useState(false);
   const [annualTarget, setAnnualTarget]   = useState(DEFAULT_SETTINGS.trainingDaysPerWeek * WEEKS_PER_YEAR);
+
+  const [fitnessGoal, setFitnessGoal]     = useState<FitnessGoal | null>(null);
+  const [fitnessProgram, setFitnessProgram] = useState<FitnessProgram | null>(null);
+  const [goalDescription, setGoalDescription] = useState('');
+  const [goalTimeframe, setGoalTimeframe] = useState('');
+  const [goalWeight, setGoalWeight]       = useState('');
+  const [settingGoal, setSettingGoal]     = useState(false);
+  const [goalError, setGoalError]         = useState<string | null>(null);
 
   useFocusEffect(
     useCallback(() => {
@@ -89,6 +130,9 @@ export function FitnessScreen() {
         try {
           const settings = await getSettings();
           if (active) setAnnualTarget(settings.trainingDaysPerWeek * WEEKS_PER_YEAR);
+
+          const [goal, program] = await Promise.all([getFitnessGoal(), getFitnessProgram()]);
+          if (active) { setFitnessGoal(goal); setFitnessProgram(program); }
 
           const dayKeys = getLast7DayKeys();
           const pastWorkout = await Promise.all(dayKeys.map((dk) => AsyncStorage.getItem(`@vitalis/workout_${dk}`)));
@@ -131,10 +175,53 @@ export function FitnessScreen() {
       AsyncStorage.setItem(KEYS.workout(dateKey), completed.category).catch(() => {}),
     ]);
     setShowModal(false);
+    setLaunchWithProgram(false);
     setLastSession({ session, dateKey });
     setHistory((prev) => [{ session }, ...prev.filter((h) => h.session.date !== dateKey)].slice(0, 6));
     setWeekActive((prev) => Math.min(7, prev + (history.some((h) => h.session.date === dateKey) ? 0 : 1)));
-  }, [dateKey, history]);
+
+    if (completed.loggedExercises && completed.loggedExercises.length > 0 && fitnessProgram) {
+      const allExercises = fitnessProgram.days.flatMap((d) => d.exercises);
+      const pairs = completed.loggedExercises
+        .map((log) => {
+          const exercise = allExercises.find((e) => e.exerciseId === log.exerciseId);
+          return exercise ? { exercise, log } : null;
+        })
+        .filter((x): x is { exercise: ProgramExercise; log: LoggedExercise } => x !== null);
+      presentWeightSuggestions(pairs, () => { getFitnessProgram().then(setFitnessProgram); });
+    }
+  }, [dateKey, history, fitnessProgram]);
+
+  // Routes a structured goal straight into Vitalis AI (same pipeline as
+  // chatting with it) so the app has exactly one place that turns a stated
+  // goal into a program — services/coach.ts's applyCoachActions.
+  const handleSetGoal = useCallback(async () => {
+    const desc = goalDescription.trim();
+    if (!desc || settingGoal) return;
+    setSettingGoal(true);
+    setGoalError(null);
+    const timeframePart = goalTimeframe.trim() ? ` Timeframe: ${goalTimeframe.trim()}.` : '';
+    const weightNum = parseFloat(goalWeight);
+    const weightPart = !isNaN(weightNum) && weightNum > 0 ? ` My current weight is ${weightNum}kg.` : '';
+    const question = `Set up a fitness program for this goal: ${desc}.${timeframePart}${weightPart} Please build my full weekly split.`;
+
+    const result = await askCoach(question);
+    setSettingGoal(false);
+    if ('error' in result) { setGoalError(result.error); return; }
+
+    const [goal, program] = await Promise.all([getFitnessGoal(), getFitnessProgram()]);
+    setFitnessGoal(goal);
+    setFitnessProgram(program);
+    if (!program) {
+      setGoalError(result.reply || "Vitalis AI didn't set up a program — try describing your goal a bit more specifically.");
+    } else {
+      setGoalDescription('');
+      setGoalTimeframe('');
+      setGoalWeight('');
+    }
+  }, [goalDescription, goalTimeframe, goalWeight, settingGoal]);
+
+  const todaySplit = getSplitDayFor(fitnessProgram, new Date());
 
   const weeklyTarget = Math.round(annualTarget / WEEKS_PER_YEAR);
   const remaining = Math.max(0, weeklyTarget - weekActive);
@@ -149,10 +236,11 @@ export function FitnessScreen() {
     <SafeAreaView style={s.safe} edges={['top', 'left', 'right']}>
       <WorkoutModal
         visible={showModal}
-        onClose={() => setShowModal(false)}
+        onClose={() => { setShowModal(false); setLaunchWithProgram(false); }}
         onComplete={handleSessionComplete}
         weekActiveDays={weekActive}
         annualTarget={annualTarget}
+        programDay={launchWithProgram && todaySplit ? todaySplit : undefined}
       />
 
       <ScrollView contentContainerStyle={s.scroll} showsVerticalScrollIndicator={false}>
@@ -194,6 +282,89 @@ export function FitnessScreen() {
             <Text style={s.statValue}>{consistencyPct}%</Text>
           </View>
         </View>
+
+        {/* Vitalis AI fitness goal + generated split */}
+        {!fitnessGoal ? (
+          <>
+            <Text style={s.sectionLabel}>VITALIS AI FITNESS GOAL</Text>
+            <View style={s.goalCard}>
+              <Text style={s.goalCardTitle}>Set a goal, get a real program</Text>
+              <Text style={s.goalCardSub}>Describe what you're going for — Vitalis AI builds a weekly split around it.</Text>
+              <TextInput
+                style={s.goalInput}
+                value={goalDescription}
+                onChangeText={setGoalDescription}
+                placeholder='e.g. "Michael B Jordan build"'
+                placeholderTextColor={COLORS.textMuted}
+                multiline
+              />
+              <View style={s.goalRow}>
+                <TextInput
+                  style={[s.goalInputSmall, { flex: 1 }]}
+                  value={goalTimeframe}
+                  onChangeText={setGoalTimeframe}
+                  placeholder="Timeframe (e.g. 3 months)"
+                  placeholderTextColor={COLORS.textMuted}
+                />
+                <TextInput
+                  style={[s.goalInputSmall, { flex: 1 }]}
+                  value={goalWeight}
+                  onChangeText={setGoalWeight}
+                  placeholder="Current weight (kg)"
+                  placeholderTextColor={COLORS.textMuted}
+                  keyboardType="decimal-pad"
+                />
+              </View>
+              {goalError && <Text style={s.goalError}>{goalError}</Text>}
+              <TouchableOpacity
+                onPress={handleSetGoal}
+                style={[s.goalBtn, (!goalDescription.trim() || settingGoal) && { opacity: 0.4 }]}
+                activeOpacity={0.85}
+                disabled={!goalDescription.trim() || settingGoal}
+              >
+                {settingGoal
+                  ? <ActivityIndicator size="small" color={COLORS.textInverse} />
+                  : <Text style={s.goalBtnText}>GENERATE MY PROGRAM</Text>}
+              </TouchableOpacity>
+            </View>
+          </>
+        ) : (
+          <>
+            <Text style={s.sectionLabel}>TODAY'S SPLIT</Text>
+            <View style={s.splitCard}>
+              <Text style={s.splitGoalText} numberOfLines={2}>{fitnessGoal.description}</Text>
+              {todaySplit ? (
+                <>
+                  <Text style={s.splitDayLabel}>{todaySplit.label.toUpperCase()}</Text>
+                  {todaySplit.exercises.length > 0 ? (
+                    <>
+                      <Text style={s.splitBodyParts}>{todaySplit.bodyParts.join(' · ')}</Text>
+                      <View style={s.splitExList}>
+                        {todaySplit.exercises.map((e) => (
+                          <View key={e.exerciseId} style={s.splitExRow}>
+                            <Text style={s.splitExName} numberOfLines={1}>{e.name}</Text>
+                            <Text style={s.splitExDetail}>{e.targetSets}×{e.targetReps} @ {e.currentWeightKg}kg</Text>
+                          </View>
+                        ))}
+                      </View>
+                      <TouchableOpacity
+                        onPress={() => { setLaunchWithProgram(true); setShowModal(true); }}
+                        style={s.splitStartBtn}
+                        activeOpacity={0.85}
+                      >
+                        <Text style={s.splitStartBtnText}>START TODAY'S WORKOUT</Text>
+                      </TouchableOpacity>
+                    </>
+                  ) : (
+                    <Text style={s.splitBodyParts}>Rest day</Text>
+                  )}
+                </>
+              ) : (
+                <Text style={s.splitBodyParts}>No split assigned for today.</Text>
+              )}
+            </View>
+          </>
+        )}
 
         {/* Start workout */}
         <TouchableOpacity onPress={() => setShowModal(true)} style={s.startBtn} activeOpacity={0.85}>
@@ -320,6 +491,46 @@ const s = StyleSheet.create({
   statLabel: { fontSize: 8, color: COLORS.textMuted, fontFamily: FONTS.mono ?? undefined, letterSpacing: 1.5, marginBottom: 4 },
   statValue: { fontSize: FONT_SIZE.lg, color: COLORS.textPrimary, fontFamily: FONTS.heading ?? undefined, fontWeight: '700' },
   statValueDim: { fontSize: FONT_SIZE.sm, color: COLORS.textMuted, fontWeight: '400' },
+
+  goalCard: {
+    backgroundColor: COLORS.surface, borderWidth: 1, borderColor: COLORS.borderDim,
+    borderRadius: RADII.lg, padding: SPACING.md, marginBottom: SPACING.lg, gap: SPACING.sm,
+  },
+  goalCardTitle: { fontSize: FONT_SIZE.base, color: COLORS.textPrimary, fontFamily: FONTS.heading ?? undefined, fontWeight: '700' },
+  goalCardSub: { fontSize: FONT_SIZE.xs, color: COLORS.textMuted, lineHeight: 17, marginBottom: SPACING.xs },
+  goalInput: {
+    borderWidth: 1, borderColor: COLORS.borderNeon, borderRadius: RADII.sm,
+    paddingHorizontal: SPACING.md, paddingVertical: SPACING.sm, minHeight: 44,
+    color: COLORS.textPrimary, fontFamily: FONTS.body ?? undefined, fontSize: FONT_SIZE.sm,
+    backgroundColor: COLORS.surfaceElevated, textAlignVertical: 'top',
+  },
+  goalRow: { flexDirection: 'row', gap: SPACING.sm },
+  goalInputSmall: {
+    borderWidth: 1, borderColor: COLORS.borderNeon, borderRadius: RADII.sm,
+    paddingHorizontal: SPACING.sm, paddingVertical: SPACING.sm,
+    color: COLORS.textPrimary, fontFamily: FONTS.body ?? undefined, fontSize: FONT_SIZE.xs,
+    backgroundColor: COLORS.surfaceElevated,
+  },
+  goalError: { fontSize: FONT_SIZE.xs, color: COLORS.red, fontFamily: FONTS.body ?? undefined },
+  goalBtn: { backgroundColor: COLORS.textPrimary, borderRadius: RADII.sm, paddingVertical: SPACING.sm + 2, alignItems: 'center' },
+  goalBtnText: { fontSize: FONT_SIZE.xs, color: COLORS.textInverse, fontFamily: FONTS.mono ?? undefined, fontWeight: '700', letterSpacing: 1.5 },
+
+  splitCard: {
+    backgroundColor: COLORS.surface, borderWidth: 1, borderColor: COLORS.borderDim,
+    borderRadius: RADII.lg, padding: SPACING.md, marginBottom: SPACING.lg, gap: 4,
+  },
+  splitGoalText: { fontSize: FONT_SIZE.xs, color: COLORS.textMuted, fontFamily: FONTS.body ?? undefined, marginBottom: SPACING.xs },
+  splitDayLabel: { fontSize: FONT_SIZE.lg, color: COLORS.textPrimary, fontFamily: FONTS.heading ?? undefined, fontWeight: '700' },
+  splitBodyParts: { fontSize: FONT_SIZE.xs, color: COLORS.textSecondary, fontFamily: FONTS.mono ?? undefined, letterSpacing: 0.5, marginBottom: SPACING.sm },
+  splitExList: { gap: SPACING.xs },
+  splitExRow: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+    paddingVertical: SPACING.xs, borderTopWidth: 1, borderTopColor: COLORS.borderDim,
+  },
+  splitExName: { flex: 1, fontSize: FONT_SIZE.sm, color: COLORS.textPrimary, fontFamily: FONTS.bodyMedium ?? undefined },
+  splitExDetail: { fontSize: FONT_SIZE.xxs, color: COLORS.textMuted, fontFamily: FONTS.mono ?? undefined },
+  splitStartBtn: { backgroundColor: COLORS.textPrimary, borderRadius: RADII.sm, paddingVertical: SPACING.sm + 2, alignItems: 'center', marginTop: SPACING.sm },
+  splitStartBtnText: { fontSize: FONT_SIZE.xs, color: COLORS.textInverse, fontFamily: FONTS.mono ?? undefined, fontWeight: '700', letterSpacing: 1.5 },
 
   startBtn: {
     backgroundColor: COLORS.textPrimary, borderRadius: RADII.md,

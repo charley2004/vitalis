@@ -1,13 +1,19 @@
 import {
-  CalendarEvent, Occurrence, EVENT_CATEGORIES, EventCategory,
-  getEvents, getStatusMap, occurrencesForDateSync, upsertEvent, moveOccurrence,
-  addDaysKey, weekdayOf, fmtTime, fmtDuration, fmtDateHuman, findFreeSlots,
+  CalendarEvent, getEvents, getStatusMap, occurrencesForDateSync,
+  moveOccurrence, setOccurrenceStatus,
+  addDaysKey, weekdayOf, fmtTime,
 } from './calendar';
 import { bestSlotFor } from './planner';
+import { supabase, isSupabaseConfigured } from './supabase';
 import { getTodayKey } from './storage';
 
-// Rule-based assistant: parses common scheduling questions and commands.
-// Runs entirely on-device — no network, no API key.
+// AI-backed assistant — Claude reads the schedule below and either answers
+// directly or returns a structured action (a tool call keyed by the real
+// event id + the occurrence's own date). The model never touches storage;
+// every action is executed here through the same safe primitives the rest
+// of Planner uses — moveOccurrence (so a recurring event's whole series
+// can't get dragged by a "just this once" request) and bestSlotFor (so slot
+// math stays deterministic instead of asking the model to compute times).
 
 export interface AssistantReply {
   reply: string;
@@ -15,222 +21,128 @@ export interface AssistantReply {
   changed: boolean;
 }
 
-// ─── Date & time word parsing ─────────────────────────────────────────────────
-
-const WEEKDAYS = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
-
-function resolveDateWord(text: string): string | null {
-  const today = getTodayKey();
-  if (/\btoday\b/.test(text)) return today;
-  if (/\btomorrow\b/.test(text)) return addDaysKey(today, 1);
-  if (/\byesterday\b/.test(text)) return addDaysKey(today, -1);
-  for (let i = 0; i < WEEKDAYS.length; i++) {
-    if (new RegExp(`\\b${WEEKDAYS[i]}\\b`).test(text)) {
-      // Next occurrence of that weekday (1–7 days ahead)
-      const todayWd = weekdayOf(today);
-      let delta = (i - todayWd + 7) % 7;
-      if (delta === 0) delta = 7;
-      return addDaysKey(today, delta);
-    }
-  }
-  return null;
+export interface AssistantTurn {
+  role: 'user' | 'assistant';
+  content: string;
 }
 
-function parseTimeWord(text: string): number | null {
-  // "3pm", "3 pm", "15:00", "9:30am"
-  const m = text.match(/\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/);
-  if (!m) return null;
-  let h = Number(m[1]);
-  const min = m[2] ? Number(m[2]) : 0;
-  const period = m[3];
-  if (period === 'pm' && h < 12) h += 12;
-  if (period === 'am' && h === 12) h = 0;
-  if (!period && h <= 7) h += 12; // "at 3" almost always means 3 PM
-  if (h > 23 || min > 59) return null;
-  return h * 60 + min;
-}
+const CONTEXT_DAYS = 14;
+const WEEKDAY_ABBR = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+const HISTORY_TURNS = 6;
 
-// ─── Event lookup ─────────────────────────────────────────────────────────────
+type StatusMap = Record<string, 'completed' | 'skipped'>;
 
-function matchCategory(text: string): EventCategory | null {
-  for (const cat of EVENT_CATEGORIES) {
-    if (text.includes(cat.toLowerCase())) return cat;
-  }
-  if (/\bwork ?out|training\b/.test(text)) return 'GYM';
-  if (/\bbank\b/.test(text)) return 'FINANCE';
-  if (/\bdoctor|dentist|appointment\b/.test(text)) return 'HEALTH';
-  if (/\bclass|lecture\b/.test(text)) return 'STUDY';
-  return null;
-}
-
-function findEventByText(events: CalendarEvent[], text: string): CalendarEvent | null {
-  // Try full title containment first, then word overlap
-  const lower = text.toLowerCase();
-  let match = events.find((e) => lower.includes(e.title.toLowerCase()));
-  if (match) return match;
-
-  const cat = matchCategory(lower);
-  if (cat) {
-    match = events.find((e) => e.category === cat);
-    if (match) return match;
-  }
-
-  const words = lower.split(/\s+/).filter((w) => w.length >= 4);
-  let best: { event: CalendarEvent; hits: number } | null = null;
-  for (const e of events) {
-    const titleWords = e.title.toLowerCase().split(/\s+/);
-    const hits = titleWords.filter((tw) => words.includes(tw)).length;
-    if (hits > 0 && (!best || hits > best.hits)) best = { event: e, hits };
-  }
-  return best?.event ?? null;
-}
-
-/** Which date's instance a chat "move X to Friday" command should act on —
- *  the event's own date for a one-off event, or the nearest not-yet-resolved
- *  occurrence (today or later) for a recurring one, within the next 60 days. */
-function nearestPendingOccurrenceDate(
-  events: CalendarEvent[],
-  statusMap: Record<string, 'completed' | 'skipped'>,
-  event: CalendarEvent,
-  today: string,
-): string {
-  if (event.repeat === 'none') return event.date;
-  for (let i = 0; i < 60; i++) {
-    const key = addDaysKey(today, i);
-    const occ = occurrencesForDateSync([event], statusMap, key)[0];
-    if (occ && occ.status === 'pending') return key;
-  }
-  return today;
-}
-
-function describeDay(occs: Occurrence[], dateKey: string): string {
-  const active = occs.filter((o) => o.status !== 'skipped');
-  if (active.length === 0) return `Nothing scheduled for ${fmtDateHuman(dateKey)}. The day is free.`;
-  const lines = active.map((o) => {
-    const time = o.start !== null
-      ? `${fmtTime(o.start)}${o.end !== null ? `–${fmtTime(o.end)}` : ''}`
-      : 'flexible';
-    return `• ${o.event.title} (${time})`;
-  });
-  return `${fmtDateHuman(dateKey)}:\n${lines.join('\n')}`;
-}
-
-// ─── Main entry ───────────────────────────────────────────────────────────────
-
-export async function askAssistant(rawInput: string): Promise<AssistantReply> {
-  const text = rawInput.trim().toLowerCase();
-  if (!text) return { reply: 'Ask me about your schedule — e.g. "What do I have tomorrow?"', changed: false };
-
-  const [events, statusMap] = await Promise.all([getEvents(), getStatusMap()]);
-  const today = getTodayKey();
-
-  // ── Reschedule / move commands ──────────────────────────────────────────────
-  if (/\b(reschedule|move|shift|postpone)\b/.test(text)) {
-    const event = findEventByText(events, text);
-    if (!event) {
-      return { reply: "I couldn't find that event. Try using its exact title.", changed: false };
-    }
-
-    const targetDate = resolveDateWord(text);
-    // Strip the event title before parsing time so digits in titles don't confuse it
-    const timePart = text.replace(event.title.toLowerCase(), '');
-    // A command can legitimately contain "at" twice (e.g. "move X at 9am to
-    // Friday at 3pm") — the intended target time is the LAST "at", not the
-    // first, since the original time is usually mentioned before the new one.
-    const atSegments = timePart.split(/\bat\b/);
-    const targetTime = atSegments.length > 1 ? parseTimeWord(atSegments[atSegments.length - 1]) : null;
-
-    if (!targetDate && targetTime === null) {
-      // No explicit target — pick the best free slot on its current date
-      const occs = occurrencesForDateSync(events, statusMap, event.date)
-        .filter((o) => o.event.id !== event.id);
-      const slot = bestSlotFor(event, occs, event.date);
-      if (!slot) {
-        return { reply: `I couldn't find a free slot for "${event.title}" on ${fmtDateHuman(event.date)}. Try naming a day: "move ${event.title} to Friday".`, changed: false };
-      }
-      await upsertEvent({ ...event, start: slot.start, end: slot.end });
-      return { reply: `Moved "${event.title}" to ${fmtTime(slot.start)}–${fmtTime(slot.end)}. ${slot.reason}.`, changed: true };
-    }
-
-    const timeOverride = targetTime !== null
-      ? {
-          start: targetTime,
-          end: targetTime + (event.end !== null && event.start !== null ? event.end - event.start : event.durationMinutes),
-        }
-      : undefined;
-
-    if (!targetDate) {
-      // Time-only change, same day — a direct, safe edit regardless of repeat.
-      await upsertEvent({ ...event, start: timeOverride!.start, end: timeOverride!.end });
-      return { reply: `Done — "${event.title}" is now at ${fmtTime(timeOverride!.start!)}.`, changed: true };
-    }
-
-    // Moving to a different day — for a recurring event this must not drag
-    // every other occurrence along with it (see moveOccurrence()).
-    const fromDateKey = nearestPendingOccurrenceDate(events, statusMap, event, today);
-    const moved = await moveOccurrence(event.id, fromDateKey, targetDate, timeOverride);
-    if (!moved) {
-      return { reply: `I couldn't move "${event.title}".`, changed: false };
-    }
-    return { reply: `Done — "${event.title}" is now on ${fmtDateHuman(targetDate)}${moved.start !== null ? ` at ${fmtTime(moved.start)}` : ''}.`, changed: true };
-  }
-
-  // ── "When is my next X?" ────────────────────────────────────────────────────
-  if (/\b(when|next)\b/.test(text)) {
-    const cat = matchCategory(text);
-    const byTitle = findEventByText(events, text);
-    const candidates = events.filter((e) =>
-      (cat && e.category === cat) || (byTitle && e.id === byTitle.id));
-    const pool = candidates.length > 0 ? candidates : (byTitle ? [byTitle] : []);
-
-    if (pool.length > 0) {
-      // Scan the next 60 days for the earliest occurrence
-      for (let i = 0; i < 60; i++) {
-        const key = addDaysKey(today, i);
-        const occs = occurrencesForDateSync(pool, statusMap, key)
-          .filter((o) => o.status === 'pending');
-        const nowMin = new Date().getHours() * 60 + new Date().getMinutes();
-        const upcoming = occs.find((o) => i > 0 || o.start === null || o.start >= nowMin);
-        if (upcoming) {
-          const when = upcoming.start !== null ? ` at ${fmtTime(upcoming.start)}` : '';
-          return {
-            reply: `Your next ${upcoming.event.title} is ${i === 0 ? 'today' : i === 1 ? 'tomorrow' : fmtDateHuman(key)}${when}.`,
-            changed: false,
-          };
-        }
-      }
-      return { reply: `Nothing matching that is scheduled in the next 60 days.`, changed: false };
-    }
-  }
-
-  // ── Free time questions ─────────────────────────────────────────────────────
-  if (/\bfree\b/.test(text)) {
-    const dateKey = resolveDateWord(text) ?? today;
+function buildScheduleContext(events: CalendarEvent[], statusMap: StatusMap, today: string): string {
+  const lines: string[] = [`Today: ${today} (${WEEKDAY_ABBR[weekdayOf(today)]})`, '', `Upcoming schedule (next ${CONTEXT_DAYS} days):`];
+  for (let i = 0; i < CONTEXT_DAYS; i++) {
+    const dateKey = addDaysKey(today, i);
     const occs = occurrencesForDateSync(events, statusMap, dateKey);
-    let slots = findFreeSlots(occs, 30);
-
-    if (/\bafternoon\b/.test(text)) slots = slots.filter((s) => s.end > 12 * 60 && s.start < 18 * 60);
-    if (/\bmorning\b/.test(text)) slots = slots.filter((s) => s.start < 12 * 60);
-    if (/\bevening|tonight\b/.test(text)) slots = slots.filter((s) => s.end > 17 * 60);
-
-    if (slots.length === 0) {
-      return { reply: `No meaningful free time ${dateKey === today ? 'today' : `on ${fmtDateHuman(dateKey)}`} in that period — your schedule is full.`, changed: false };
+    for (const occ of occs) {
+      const time = occ.start !== null && occ.end !== null ? `${fmtTime(occ.start)}-${fmtTime(occ.end)}` : 'flexible';
+      lines.push(
+        `id:${occ.event.id} | ${occ.event.title} | ${WEEKDAY_ABBR[weekdayOf(dateKey)]} ${dateKey} | ${time} | ` +
+        `repeat:${occ.event.repeat} | status:${occ.status} | priority:${occ.event.priority}`
+      );
     }
-    const total = slots.reduce((sum, s) => sum + (s.end - s.start), 0);
-    const list = slots.slice(0, 4).map((s) => `${fmtTime(s.start)}–${fmtTime(s.end)}`).join(', ');
-    return { reply: `Yes — about ${fmtDuration(total)} free: ${list}.`, changed: false };
+  }
+  if (lines.length === 3) lines.push('(nothing scheduled)');
+  return lines.join('\n');
+}
+
+/** Parses a Claude-supplied "HH:MM" (24h) into a start/end pair using the
+ *  event's existing duration, or null if the string isn't well-formed. */
+function parseTimeOverride(toTime: string, event: CalendarEvent): { start: number; end: number } | null {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(toTime.trim());
+  if (!m) return null;
+  const h = Number(m[1]), min = Number(m[2]);
+  if (h > 23 || min > 59) return null;
+  const start = h * 60 + min;
+  const duration = event.start !== null && event.end !== null ? event.end - event.start : event.durationMinutes;
+  return { start, end: start + duration };
+}
+
+type Action =
+  | { type: 'move'; eventId: string; fromDate: string; toDate: string; toTime?: string }
+  | { type: 'find_slot'; eventId: string; fromDate: string; toDate: string }
+  | { type: 'status'; eventId: string; date: string; status: 'completed' | 'skipped' };
+
+async function applyAction(action: Action, events: CalendarEvent[], statusMap: StatusMap): Promise<string | null> {
+  const event = events.find((e) => e.id === action.eventId);
+  if (!event) return "Couldn't find one item to update — it may have changed since I last synced.";
+
+  if (action.type === 'move') {
+    const timeOverride = action.toTime ? parseTimeOverride(action.toTime, event) : undefined;
+    await moveOccurrence(event.id, action.fromDate, action.toDate, timeOverride ?? undefined);
+    return null;
   }
 
-  // ── "What do I have <day>?" / agenda ────────────────────────────────────────
-  const dateKey = resolveDateWord(text);
-  if (dateKey || /\bwhat\b|\bhave\b|\bschedule\b|\bagenda\b|\bplan\b/.test(text)) {
-    const key = dateKey ?? today;
-    const occs = occurrencesForDateSync(events, statusMap, key);
-    return { reply: describeDay(occs, key), changed: false };
+  if (action.type === 'find_slot') {
+    const dayOccs = occurrencesForDateSync(events, statusMap, action.toDate).filter((o) => o.event.id !== event.id);
+    const slot = bestSlotFor(event, dayOccs, action.toDate);
+    if (!slot) return `Couldn't find a free slot for "${event.title}" that day.`;
+    await moveOccurrence(event.id, action.fromDate, action.toDate, { start: slot.start, end: slot.end });
+    return null;
   }
 
-  return {
-    reply: 'I can answer things like:\n• "What do I have tomorrow?"\n• "When is my next exam?"\n• "Do I have free time this afternoon?"\n• "Move my gym session to Friday at 3pm"',
-    changed: false,
-  };
+  if (action.type === 'status') {
+    await setOccurrenceStatus(event.id, action.date, action.status);
+    return null;
+  }
+
+  return null;
+}
+
+const MAX_ACTIONS = 8;
+
+/** Applies every action from one turn in order, refetching state before
+ *  each — so a later find_slot in the same batch sees the free time an
+ *  earlier move in that batch just opened up, instead of working off a
+ *  snapshot from before this turn's changes started landing. */
+async function applyActions(actions: Action[]): Promise<{ appliedCount: number; problems: string[] }> {
+  let appliedCount = 0;
+  const problems: string[] = [];
+  for (const action of actions.slice(0, MAX_ACTIONS)) {
+    const [events, statusMap] = await Promise.all([getEvents(), getStatusMap()]);
+    const problem = await applyAction(action, events, statusMap);
+    if (problem) problems.push(problem);
+    else appliedCount++;
+  }
+  return { appliedCount, problems };
+}
+
+export async function askAssistant(question: string, history: AssistantTurn[] = []): Promise<AssistantReply> {
+  const trimmed = question.trim();
+  if (!trimmed) {
+    return { reply: 'Ask me about your schedule — e.g. "What do I have tomorrow?" or "Move my gym session to Friday at 3pm."', changed: false };
+  }
+
+  if (!isSupabaseConfigured || !supabase) {
+    return { reply: 'The assistant needs cloud sync configured first (Settings → Account & Sync).', changed: false };
+  }
+  const { data: sessionData } = await supabase.auth.getSession();
+  if (!sessionData.session) {
+    return { reply: 'Sign in (Settings → Account & Sync) to use the assistant.', changed: false };
+  }
+
+  try {
+    const [events, statusMap] = await Promise.all([getEvents(), getStatusMap()]);
+    const today = getTodayKey();
+    const context = buildScheduleContext(events, statusMap, today);
+
+    const { data, error } = await supabase.functions.invoke('planner-assistant', {
+      body: { context, question: trimmed, history: history.slice(-HISTORY_TURNS) },
+    });
+    if (error) return { reply: error.message ?? 'The assistant request failed.', changed: false };
+    if (data?.error) return { reply: data.error as string, changed: false };
+
+    const reply = (data?.reply as string) ?? 'Done.';
+    const actions = (data?.actions as Action[] | null | undefined) ?? [];
+    if (actions.length === 0) return { reply, changed: false };
+
+    const { appliedCount, problems } = await applyActions(actions);
+    const suffix = problems.length > 0 ? `\n\n(${problems.join(' ')})` : '';
+    return { reply: `${reply}${suffix}`, changed: appliedCount > 0 };
+  } catch (e) {
+    return { reply: e instanceof Error ? e.message : 'The assistant request failed.', changed: false };
+  }
 }

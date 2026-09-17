@@ -15,7 +15,8 @@ import {
   type WgerExercise,
 } from '../services/wger';
 import { ExerciseImage } from '../components/ExerciseImage';
-import { getSettings, type AppSettings } from '../services/storage';
+import { getSettings, type AppSettings, type LoggedExercise } from '../services/storage';
+import type { SplitDay } from '../services/fitness';
 import { COLORS, FONTS, FONT_SIZE, SPACING, RADII } from '../theme';
 import * as Haptics from 'expo-haptics';
 
@@ -29,6 +30,7 @@ export interface CompletedSession {
   exerciseIds: string[];
   completedIds: string[];
   category: 'upper' | 'lower' | 'cardio' | 'full';
+  loggedExercises?: LoggedExercise[];
 }
 
 interface Props {
@@ -37,6 +39,11 @@ interface Props {
   onComplete: (session: CompletedSession) => void;
   weekActiveDays: number;
   annualTarget?: number;
+  /** Today's assigned split day, when launched from "Start Today's Workout" —
+   *  pre-selects these exercises (still editable in setup) and, once the
+   *  session ends, offers a quick weight/reps log for each so progressive
+   *  overload has real numbers to work from. Undefined for an ad-hoc session. */
+  programDay?: SplitDay;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -1311,12 +1318,18 @@ const actv = StyleSheet.create({
 
 // ─── Complete ─────────────────────────────────────────────────────────────────
 
+interface LoggedInput { weightKg: string; reps: string; tooHeavy: boolean }
+
 function CompleteView({
   totalElapsed,
   selectedIds,
   completedIds,
   phases,
   phaseIndex,
+  programExercises,
+  loggedWeights,
+  onChangeLoggedWeight,
+  onToggleTooHeavy,
   onSave,
 }: {
   totalElapsed: number;
@@ -1324,6 +1337,10 @@ function CompleteView({
   completedIds: Set<string>;
   phases: Phase[];
   phaseIndex: number;
+  programExercises?: { exerciseId: string; name: string; targetSets: number; targetReps: string; currentWeightKg: number }[];
+  loggedWeights: Record<string, LoggedInput>;
+  onChangeLoggedWeight: (exerciseId: string, field: 'weightKg' | 'reps', value: string) => void;
+  onToggleTooHeavy: (exerciseId: string) => void;
   onSave: () => void;
 }) {
   const mins = Math.max(1, Math.floor(totalElapsed / 60));
@@ -1333,7 +1350,7 @@ function CompleteView({
   const phasePct = phases.length > 0 ? Math.round((phasesCompleted / phases.length) * 100) : 0;
 
   return (
-    <View style={complete.wrap}>
+    <ScrollView contentContainerStyle={complete.wrap} showsVerticalScrollIndicator={false}>
       <Text style={complete.heading}>SESSION{'\n'}COMPLETE</Text>
       <View style={complete.statsRow}>
         <View style={complete.stat}>
@@ -1351,10 +1368,58 @@ function CompleteView({
           <Text style={complete.statUnit}>PLAN DONE</Text>
         </View>
       </View>
+
+      {programExercises && programExercises.length > 0 && (
+        <View style={complete.logSection}>
+          <Text style={complete.logTitle}>LOG TODAY'S LIFTS</Text>
+          <Text style={complete.logSub}>So Vitalis AI can suggest next week's weight — leave a row blank to skip logging it.</Text>
+          {programExercises.map((e) => {
+            const entry = loggedWeights[e.exerciseId] ?? { weightKg: String(e.currentWeightKg), reps: '', tooHeavy: false };
+            return (
+              <View key={e.exerciseId} style={complete.logRow}>
+                <Text style={complete.logExName} numberOfLines={1}>{e.name}</Text>
+                <Text style={complete.logExTarget}>{e.targetSets}×{e.targetReps} target</Text>
+                <View style={complete.logInputsRow}>
+                  <View style={complete.logInputCol}>
+                    <Text style={complete.logInputLabel}>KG</Text>
+                    <TextInput
+                      style={complete.logInput}
+                      value={entry.weightKg}
+                      onChangeText={(v) => onChangeLoggedWeight(e.exerciseId, 'weightKg', v)}
+                      keyboardType="decimal-pad"
+                      placeholder="0"
+                      placeholderTextColor={COLORS.textMuted}
+                    />
+                  </View>
+                  <View style={complete.logInputCol}>
+                    <Text style={complete.logInputLabel}>REPS</Text>
+                    <TextInput
+                      style={complete.logInput}
+                      value={entry.reps}
+                      onChangeText={(v) => onChangeLoggedWeight(e.exerciseId, 'reps', v)}
+                      keyboardType="number-pad"
+                      placeholder="—"
+                      placeholderTextColor={COLORS.textMuted}
+                    />
+                  </View>
+                  <TouchableOpacity
+                    onPress={() => onToggleTooHeavy(e.exerciseId)}
+                    activeOpacity={0.7}
+                    style={[complete.tooHeavyBtn, entry.tooHeavy && complete.tooHeavyBtnActive]}
+                  >
+                    <Text style={[complete.tooHeavyText, entry.tooHeavy && { color: COLORS.textInverse }]}>TOO HEAVY</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+            );
+          })}
+        </View>
+      )}
+
       <TouchableOpacity onPress={onSave} activeOpacity={0.8} style={complete.saveBtn}>
         <Text style={complete.saveBtnText}>SAVE & CLOSE</Text>
       </TouchableOpacity>
-    </View>
+    </ScrollView>
   );
 }
 
@@ -1375,6 +1440,31 @@ const complete = StyleSheet.create({
     alignSelf: 'stretch', alignItems: 'center',
   },
   saveBtnText: { fontSize: FONT_SIZE.sm, color: COLORS.textInverse, fontFamily: FONTS.heading ?? undefined, fontWeight: '700', letterSpacing: 2 },
+
+  logSection: { alignSelf: 'stretch', gap: SPACING.sm },
+  logTitle: { fontSize: 9, color: COLORS.textMuted, fontFamily: FONTS.mono ?? undefined, letterSpacing: 2, fontWeight: '700' },
+  logSub: { fontSize: FONT_SIZE.xxs, color: COLORS.textMuted, lineHeight: 15, marginBottom: SPACING.xs },
+  logRow: {
+    borderWidth: 1, borderColor: COLORS.borderDim, borderRadius: RADII.md,
+    padding: SPACING.sm + 2, gap: 6,
+  },
+  logExName: { fontSize: FONT_SIZE.sm, color: COLORS.textPrimary, fontFamily: FONTS.bodySemi ?? undefined, fontWeight: '600' },
+  logExTarget: { fontSize: FONT_SIZE.xxs, color: COLORS.textMuted, fontFamily: FONTS.mono ?? undefined },
+  logInputsRow: { flexDirection: 'row', alignItems: 'flex-end', gap: SPACING.sm, marginTop: 2 },
+  logInputCol: { gap: 4 },
+  logInputLabel: { fontSize: 8, color: COLORS.textMuted, fontFamily: FONTS.mono ?? undefined, letterSpacing: 1 },
+  logInput: {
+    width: 64, borderWidth: 1, borderColor: COLORS.borderNeon, borderRadius: RADII.sm,
+    paddingHorizontal: SPACING.sm, paddingVertical: 6, color: COLORS.textPrimary,
+    fontFamily: FONTS.body ?? undefined, fontSize: FONT_SIZE.sm, textAlign: 'center',
+    backgroundColor: COLORS.surface,
+  },
+  tooHeavyBtn: {
+    flex: 1, borderWidth: 1, borderColor: COLORS.borderNeon, borderRadius: RADII.sm,
+    paddingVertical: 8, alignItems: 'center', justifyContent: 'center',
+  },
+  tooHeavyBtnActive: { backgroundColor: COLORS.red, borderColor: COLORS.red },
+  tooHeavyText: { fontSize: 9, color: COLORS.textMuted, fontFamily: FONTS.mono ?? undefined, letterSpacing: 1, fontWeight: '700' },
 });
 
 // ─── Shared UI ────────────────────────────────────────────────────────────────
@@ -1459,7 +1549,7 @@ const hdr = StyleSheet.create({
 
 // ─── WorkoutModal ─────────────────────────────────────────────────────────────
 
-export function WorkoutModal({ visible, onClose, onComplete, weekActiveDays, annualTarget = ANNUAL_TARGET_DEFAULT }: Props) {
+export function WorkoutModal({ visible, onClose, onComplete, weekActiveDays, annualTarget = ANNUAL_TARGET_DEFAULT, programDay }: Props) {
   const [step, setStep]                      = useState<Step>('browse');
   const [activeBodyPart, setActiveBodyPart]  = useState<BodyPart | null>(null);
   const [selectedIds, setSelectedIds]        = useState<Set<string>>(new Set());
@@ -1476,9 +1566,27 @@ export function WorkoutModal({ visible, onClose, onComplete, weekActiveDays, ann
   const [extraExercises, setExtraExercises]  = useState<Map<string, Exercise>>(new Map());
   const [defaultFilter, setDefaultFilter]    = useState<EquipFilter>('all');
   const [fitnessLevel, setFitnessLevel]      = useState<AppSettings['fitnessLevel']>('intermediate');
+  const [loggedWeights, setLoggedWeights]    = useState<Record<string, LoggedInput>>({});
   const timerRef                             = useRef<ReturnType<typeof setInterval> | null>(null);
   const phasesRef                            = useRef<Phase[]>([]);
   const prevOrderedLenRef                    = useRef(0);
+
+  // Pre-select today's program exercises and jump straight to setup for
+  // review — still fully editable/removable there, matching an ad-hoc
+  // session's flow from that point on.
+  useEffect(() => {
+    if (!visible || !programDay || programDay.exercises.length === 0) return;
+    const ids = programDay.exercises.map((e) => e.exerciseId);
+    setSelectedIds(new Set(ids));
+    setOrderedIds(ids);
+    setStep('setup');
+    const init: Record<string, LoggedInput> = {};
+    programDay.exercises.forEach((e) => {
+      init[e.exerciseId] = { weightKg: String(e.currentWeightKg), reps: '', tooHeavy: false };
+    });
+    setLoggedWeights(init);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visible, programDay]);
 
   // Prefetch wger data so it's ready when user opens exercise view, and pick
   // up equipment/fitness-level preferences from onboarding for this session.
@@ -1520,6 +1628,7 @@ export function WorkoutModal({ visible, onClose, onComplete, weekActiveDays, ann
       setPhaseTimeLeft(0);
       setTotalElapsed(0);
       setExtraExercises(new Map());
+      setLoggedWeights({});
       phasesRef.current = [];
       prevOrderedLenRef.current = 0;
     }
@@ -1672,14 +1781,45 @@ export function WorkoutModal({ visible, onClose, onComplete, weekActiveDays, ann
     Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
   }, [phaseIndex]);
 
+  const handleChangeLoggedWeight = useCallback((exerciseId: string, field: 'weightKg' | 'reps', value: string) => {
+    setLoggedWeights((prev) => ({
+      ...prev,
+      [exerciseId]: { ...(prev[exerciseId] ?? { weightKg: '', reps: '', tooHeavy: false }), [field]: value },
+    }));
+  }, []);
+
+  const handleToggleTooHeavy = useCallback((exerciseId: string) => {
+    setLoggedWeights((prev) => ({
+      ...prev,
+      [exerciseId]: { ...(prev[exerciseId] ?? { weightKg: '', reps: '', tooHeavy: false }), tooHeavy: !(prev[exerciseId]?.tooHeavy) },
+    }));
+  }, []);
+
   const handleSave = useCallback(() => {
+    // Only exercises the user actually filled in a rep count for get logged —
+    // a blank row means "skip logging this one," not "did zero reps."
+    const loggedExercises: LoggedExercise[] | undefined = programDay?.exercises
+      .map((e): LoggedExercise | null => {
+        const entry = loggedWeights[e.exerciseId];
+        const reps = entry ? parseInt(entry.reps, 10) : NaN;
+        if (!entry || isNaN(reps) || reps <= 0) return null;
+        const weightKg = parseFloat(entry.weightKg);
+        return {
+          exerciseId: e.exerciseId,
+          sets: Array.from({ length: e.targetSets }, () => ({ weightKg: isNaN(weightKg) ? e.currentWeightKg : weightKg, reps })),
+          feltTooHeavy: entry.tooHeavy ? true : undefined,
+        };
+      })
+      .filter((x): x is LoggedExercise => x !== null);
+
     onComplete({
       durationMinutes: Math.max(1, Math.floor(totalElapsed / 60)),
       exerciseIds: sessionIds,
       completedIds: Array.from(completedIds),
       category: deriveWorkoutCategory(sessionIds, extraExercises),
+      loggedExercises: loggedExercises && loggedExercises.length > 0 ? loggedExercises : undefined,
     });
-  }, [sessionIds, completedIds, totalElapsed, extraExercises, onComplete]);
+  }, [sessionIds, completedIds, totalElapsed, extraExercises, onComplete, programDay, loggedWeights]);
 
   const backAction: (() => void) | null =
     step === 'exercises' ? handleBackFromExercises :
@@ -1758,6 +1898,10 @@ export function WorkoutModal({ visible, onClose, onComplete, weekActiveDays, ann
             completedIds={completedIds}
             phases={phases}
             phaseIndex={phaseIndex}
+            programExercises={programDay?.exercises.filter((e) => sessionIds.includes(e.exerciseId))}
+            loggedWeights={loggedWeights}
+            onChangeLoggedWeight={handleChangeLoggedWeight}
+            onToggleTooHeavy={handleToggleTooHeavy}
             onSave={handleSave}
           />
         )}

@@ -6,7 +6,8 @@ import {
   DAY_START, DAY_END,
 } from './calendar';
 import {
-  getTodayKey, getRoutineConfig, getRoutineStates, getRoutineCompletionTimes, formatDateKey,
+  getTodayKey, getRoutineConfig, getRoutineStates, getRoutineCompletionTimes, getRoutineTimeOverrides,
+  effectivePreferredTime, formatDateKey,
   type RoutineDefinition,
 } from './storage';
 
@@ -147,19 +148,22 @@ function placeRoutines(
   completionTimes: Record<string, string>,
   dateKey: string,
   busy: { start: number; end: number }[],
+  overrides: Record<string, number> = {},
 ): RoutineOccurrence[] {
-  const enabled = routines.filter((r) => r.enabled !== false && r.preferredTime !== undefined);
-  const sorted = [...enabled].sort((a, b) => a.preferredTime! - b.preferredTime!);
+  const enabled = routines
+    .map((r) => ({ r, effTime: effectivePreferredTime(r, overrides) }))
+    .filter((x): x is { r: RoutineDefinition; effTime: number } => x.r.enabled !== false && x.effTime !== undefined);
+  const sorted = [...enabled].sort((a, b) => a.effTime - b.effTime);
   const placed: RoutineOccurrence[] = [];
 
   const overlapsAny = (start: number, end: number) =>
     busy.some((b) => start < b.end && b.start < end) ||
     placed.some((p) => start < p.end && p.start < end);
 
-  for (const r of sorted) {
+  for (const { r, effTime } of sorted) {
     const duration = r.durationMinutes ?? 5;
     const bounds = SLOT_BOUNDS[r.slot];
-    let start = r.preferredTime!;
+    let start = effTime;
     let shifted = false;
 
     if (overlapsAny(start, start + duration)) {
@@ -187,7 +191,7 @@ function placeRoutines(
       // Guard against a stale timestamp left over from a different day.
       if (formatDateKey(completedDate) === dateKey) {
         completedAtMinutes = completedDate.getHours() * 60 + completedDate.getMinutes();
-        if (r.preferredTime !== undefined) lateBy = completedAtMinutes - r.preferredTime;
+        lateBy = completedAtMinutes - effTime;
       }
     }
 
@@ -206,13 +210,14 @@ export function buildUnifiedAgenda(
   occs: Occurrence[],
   completionTimes: Record<string, string> = {},
   dateKey: string = getTodayKey(),
+  overrides: Record<string, number> = {},
 ): UnifiedAgenda {
   const timedPlanner = occs.filter((o) => o.start !== null && o.end !== null && o.status !== 'skipped');
   const flexible = occs.filter((o) => o.start === null);
   const conflicts = findConflicts(occs);
 
   const busy = timedPlanner.map((o) => ({ start: o.start!, end: o.end! }));
-  const routineItems = placeRoutines(routines, routineStates, completionTimes, dateKey, busy);
+  const routineItems = placeRoutines(routines, routineStates, completionTimes, dateKey, busy, overrides);
 
   interface Merged { start: number; end: number; item: AgendaItem }
   const merged: Merged[] = [
@@ -245,11 +250,12 @@ export function buildUnifiedAgenda(
 
 /** Fetches routines + today's habit states + Planner occurrences and merges them */
 export async function loadUnifiedAgenda(dateKey: string): Promise<UnifiedAgenda> {
-  const [events, statusMap, routines, routineStates, completionTimes] = await Promise.all([
+  const [events, statusMap, routines, routineStates, completionTimes, overrides] = await Promise.all([
     getEvents(), getStatusMap(), getRoutineConfig(), getRoutineStates(dateKey), getRoutineCompletionTimes(dateKey),
+    getRoutineTimeOverrides(dateKey),
   ]);
   const occs = occurrencesForDateSync(events, statusMap, dateKey);
-  return buildUnifiedAgenda(routines, routineStates, occs, completionTimes, dateKey);
+  return buildUnifiedAgenda(routines, routineStates, occs, completionTimes, dateKey, overrides);
 }
 
 /**

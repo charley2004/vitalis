@@ -1,4 +1,4 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useEffect } from 'react';
 import {
   View,
   Text,
@@ -11,6 +11,7 @@ import {
   Platform,
   Alert,
   Switch,
+  AppState,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import * as Haptics from 'expo-haptics';
@@ -24,6 +25,7 @@ import { fmtTime, fmtDuration } from '../services/calendar';
 import {
   KEYS, getTodayKey, formatDateKey,
   RoutineDefinition, getRoutineConfig, saveRoutineConfig, setRoutineHit, setRoutineSkipped, getRoutineCompletionTimes,
+  getRoutineTimeOverrides, effectivePreferredTime,
 } from '../services/storage';
 import { syncReminders } from '../services/reminders';
 
@@ -477,10 +479,11 @@ export function RoutinesScreen() {
 
   const loadRoutines = useCallback(async (active: { value: boolean }) => {
     try {
-      const [config, streakRaw, completionTimes] = await Promise.all([
+      const [config, streakRaw, completionTimes, overrides] = await Promise.all([
         getRoutineConfig(),
         AsyncStorage.getItem(KEYS.streak),
         getRoutineCompletionTimes(dateKey),
+        getRoutineTimeOverrides(dateKey),
       ]);
 
       // Fetch the last N days of routine state in one batch, then derive
@@ -507,7 +510,12 @@ export function RoutinesScreen() {
           else if (dayState === 'skipped') continue; // excused day — doesn't break the chain, doesn't extend it either
           else break;
         }
-        return { ...def, state, streak, completedAt: state === 'hit' ? completionTimes[def.id] : undefined };
+        return {
+          ...def,
+          preferredTime: effectivePreferredTime(def, overrides),
+          state, streak,
+          completedAt: state === 'hit' ? completionTimes[def.id] : undefined,
+        };
       });
 
       setRoutines(enriched);
@@ -522,6 +530,23 @@ export function RoutinesScreen() {
       return () => { active.value = false; };
     }, [loadRoutines])
   );
+
+  // React Navigation's "focus" only fires on an actual tab/screen change —
+  // resuming the app from background while Routines was already the visible
+  // tab (e.g. reopened via a "Mark Done" notification tap) never fires it,
+  // so a write that happened while backgrounded (setRoutineHit from
+  // App.tsx's handleMarkDoneAction) was silently invisible until the user
+  // navigated away and back, or re-tapped the checkbox themselves. AppState
+  // catches that case directly.
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (state) => {
+      if (state === 'active') {
+        const active = { value: true };
+        loadRoutines(active);
+      }
+    });
+    return () => sub.remove();
+  }, [loadRoutines]);
 
   const handleToggle = useCallback(
     async (id: string, hit: boolean) => {

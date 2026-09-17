@@ -482,6 +482,22 @@ export function CameraIcon({ size = 24, color = '#fff' }: IconProps) {
   );
 }
 
+export function MicIcon({ size = 24, color = '#fff' }: IconProps) {
+  return (
+    <Svg width={size} height={size} viewBox="0 0 24 24" fill="none">
+      <Path
+        d="M12 15a3 3 0 003-3V6a3 3 0 00-6 0v6a3 3 0 003 3z"
+        stroke={color}
+        strokeWidth="1.5"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <Path d="M6 11v1a6 6 0 0012 0v-1" stroke={color} strokeWidth="1.5" strokeLinecap="round" />
+      <Path d="M12 18v3M9 21h6" stroke={color} strokeWidth="1.5" strokeLinecap="round" />
+    </Svg>
+  );
+}
+
 export function DownloadIcon({ size = 24, color = '#fff' }: IconProps) {
   return (
     <Svg width={size} height={size} viewBox="0 0 24 24" fill="none">
@@ -554,6 +570,7 @@ export function AppIcon({ id, size = 20, color = '#fff' }: { id: string; size?: 
     case 'tag':          return <TagIcon size={size} color={color} />;
     case 'target':       return <TargetIcon size={size} color={color} />;
     case 'camera':       return <CameraIcon size={size} color={color} />;
+    case 'mic':          return <MicIcon size={size} color={color} />;
     case 'download':     return <DownloadIcon size={size} color={color} />;
     case 'piggy-bank':   return <PiggyBankIcon size={size} color={color} />;
     case 'fingerprint':  return <FingerprintIcon size={size} color={color} />;

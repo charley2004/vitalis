@@ -6,6 +6,7 @@ import {
   StyleSheet,
   StatusBar,
   TouchableOpacity,
+  AppState,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useFocusEffect, useNavigation } from '@react-navigation/native';
@@ -23,6 +24,7 @@ import {
 } from '../services/storage';
 import { fmtTime, fmtDuration } from '../services/calendar';
 import { loadUnifiedAgenda, UnifiedAgenda, AgendaItem } from '../services/planner';
+import { syncReminders } from '../services/reminders';
 import { QuickCaptureBar, DEFAULT_ACTIONS, QuickAction } from '../components/QuickCaptureBar';
 import { getFinanceSettings, getTotalBalance, getSavingsProgressPct, getUpcomingBills, fmtCurrency } from '../services/finance';
 
@@ -257,8 +259,7 @@ export function TodayScreen() {
     [dateKey]
   );
 
-  useFocusEffect(
-    useCallback(() => {
+  const loadToday = useCallback(() => {
       let active = true;
       const load = async () => {
         try {
@@ -328,8 +329,22 @@ export function TodayScreen() {
       };
       load();
       return () => { active = false; };
-    }, [dateKey])
-  );
+  }, [dateKey]);
+
+  useFocusEffect(useCallback(() => loadToday(), [loadToday]));
+
+  // Mirrors RoutinesScreen: React Navigation's "focus" only fires on an
+  // actual tab change, not on the app simply resuming from background while
+  // Today was already the visible tab — which is exactly what happens when
+  // the app reopens from a "Mark Done"/Snooze notification tap. Without
+  // this, a water glass logged that way stayed invisible on Today until the
+  // user switched tabs and back.
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (state) => {
+      if (state === 'active') loadToday();
+    });
+    return () => sub.remove();
+  }, [loadToday]);
 
   const appendLog = useCallback(async (label: string, emoji: string, detail: string) => {
     const entry: LogEvent = {
@@ -363,6 +378,9 @@ export function TodayScreen() {
     await AsyncStorage.setItem(KEYS.water(dateKey), String(updated));
     await appendLog('Hydrate', 'droplet', `+1 glass → ${updated} / ${settingsRef.current.waterGoal} today`);
     await recomputeScore(await readRoutines(), updated, steps, sleepHours);
+    // Re-sync so today's remaining hydration reminders reflect what's left
+    // to drink instead of nagging past a goal you've already hit manually.
+    syncReminders().catch(() => {});
   }, [waterGlasses, steps, sleepHours, dateKey, appendLog, readRoutines, recomputeScore]);
 
   const handleAddSteps = useCallback(async () => {
