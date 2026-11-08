@@ -3,12 +3,17 @@ const path = require('path');
 
 const config = getDefaultConfig(__dirname);
 
-// expo-notifications fails to bundle in Expo Go on this SDK, so it's stubbed
-// out there — but a real EAS build needs the actual module, or notification
-// permissions/scheduling silently no-op forever. EAS sets EAS_BUILD=true on
-// every cloud build (all profiles); plain `expo start` (Expo Go) does not.
-if (!process.env.EAS_BUILD) {
+// expo-notifications used to be stubbed out whenever the bundle was not built
+// by EAS (`EAS_BUILD` unset) to work around a bundling failure in Expo Go.
+// That check also caught every local native build and the sideloading CI
+// build, where it silently turned reminders and alarms into no-ops forever.
+//
+// This app cannot run in Expo Go anyway (expo-speech-recognition is a custom
+// native module), so the real package is now the default. Set
+// VITALIS_STUB_NOTIFICATIONS=1 to opt back into the stub.
+if (process.env.VITALIS_STUB_NOTIFICATIONS === '1') {
   config.resolver.extraNodeModules = {
+    ...(config.resolver.extraNodeModules ?? {}),
     'expo-notifications': path.resolve(__dirname, './stubs/notifications.js'),
   };
 }

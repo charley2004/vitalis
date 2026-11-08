@@ -2,12 +2,15 @@
   "expo": {
     "name": "vitalis",
     "slug": "vitalis",
+    "scheme": "vitalis",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "dark",
     "backgroundColor": "#0A0A0A",
     "ios": {
+      "bundleIdentifier": "com.charley2004.vitalis",
+      "buildNumber": "1",
       "supportsTablet": true,
       "infoPlist": {
         "NSSpeechRecognitionUsageDescription": "Vitalis uses speech recognition to transcribe your voice input to Vitalis AI.",
@@ -77,7 +80,8 @@
           "speechRecognitionPermission": "Vitalis uses speech recognition to transcribe your voice input to Vitalis AI."
         }
       ],
-      "expo-task-manager"
+      "expo-task-manager",
+      "./plugins/withLocalOnlyNotifications"
     ],
     "extra": {
       "eas": {

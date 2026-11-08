@@ -1,0 +1,143 @@
+name: iOS sideload build
+
+# Produces an UNSIGNED .ipa on a GitHub-hosted macOS runner. The IPA is
+# re-signed on the iPhone by AltStore/SideStore with a free Apple ID, so no
+# Apple Developer Program membership is needed and nothing goes through App
+# Store review.
+#
+# See docs/IOS-SIDELOAD.md for the full walkthrough.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ios-sideload
+  cancel-in-progress: true
+
+jobs:
+  build-ipa:
+    name: Build unsigned IPA
+    runs-on: macos-15
+    timeout-minutes: 75
+
+    env:
+      CI: '1'
+      VITALIS_SIDELOAD: '1'
+      EXPO_NO_TELEMETRY: '1'
+      # EXPO_PUBLIC_* values are inlined into the JS bundle at build time. The
+      # Supabase publishable/anon key is public by design (Row Level Security
+      # protects the data) and is already committed in eas.json.
+      EXPO_PUBLIC_SUPABASE_URL: 'https://uiejqpmakpgbrzkfbghn.supabase.co'
+      EXPO_PUBLIC_SUPABASE_ANON_KEY: 'sb_publishable_403ZYOrynb9iyhmMVwkpJQ_vcMx9A4L'
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Select Xcode 16
+        run: |
+          set -euo pipefail
+          if compgen -G "/Applications/Xcode_16*.app" > /dev/null; then
+            XCODE_APP="$(ls -d /Applications/Xcode_16*.app | sort -V | tail -n 1)"
+            sudo xcode-select -s "$XCODE_APP"
+          fi
+          xcodebuild -version
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      - name: Generate the iOS project
+        run: npx expo prebuild --platform ios --clean
+
+      - name: Check the build is free-account signable
+        run: |
+          set -euo pipefail
+          if grep -rq "aps-environment" ios/*/*.entitlements 2>/dev/null; then
+            echo "::error::aps-environment is still in the entitlements file. A free Apple ID cannot sign it; check plugins/withLocalOnlyNotifications.js."
+            exit 1
+          fi
+          echo "No push entitlement — this IPA can be re-signed with a free Apple ID."
+
+      - name: Build the app (unsigned)
+        run: |
+          set -euo pipefail
+
+          WORKSPACE="$(ls -d ios/*.xcworkspace | head -n 1)"
+          SCHEME="$(basename "$WORKSPACE" .xcworkspace)"
+
+          # Expo names the shared scheme after the project. Fall back to the
+          # first non-Pods scheme if that ever stops being true.
+          if ! xcodebuild -workspace "$WORKSPACE" -list | grep -qE "^[[:space:]]+${SCHEME}$"; then
+            SCHEME="$(xcodebuild -workspace "$WORKSPACE" -list \
+              | sed -n '/Schemes:/,$p' | tail -n +2 \
+              | sed 's/^[[:space:]]*//' | grep -v '^Pods' | head -n 1)"
+          fi
+
+          echo "Workspace: $WORKSPACE"
+          echo "Scheme:    $SCHEME"
+
+          xcodebuild \
+            -workspace "$WORKSPACE" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            -quiet \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            EXPANDED_CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package the IPA
+        run: |
+          set -euo pipefail
+
+          APP_PATH="$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' -print -quit)"
+          if [ -z "$APP_PATH" ]; then
+            echo "::error::No .app was produced."
+            exit 1
+          fi
+
+          rm -rf Payload vitalis-unsigned.ipa
+          mkdir Payload
+          cp -R "$APP_PATH" Payload/
+          # -y keeps framework symlinks as symlinks; expanding them breaks
+          # re-signing on the device.
+          zip -qry vitalis-unsigned.ipa Payload
+
+          echo "Built $(du -h vitalis-unsigned.ipa | cut -f1) IPA from $APP_PATH"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vitalis-unsigned-ipa
+          path: vitalis-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Attach IPA to the ios-latest release
+        continue-on-error: true
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ios-latest
+          name: Vitalis — iOS sideload build
+          body: |
+            Unsigned IPA built from `${{ github.sha }}`.
+
+            Re-sign and install it on your iPhone with AltStore or SideStore.
+            See `docs/IOS-SIDELOAD.md` in the repository for the walkthrough.
+          files: vitalis-unsigned.ipa
+          prerelease: true
+          make_latest: false
+          overwrite_files: true
