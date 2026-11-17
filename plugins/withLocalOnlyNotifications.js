@@ -8,8 +8,9 @@
 // time. Removing it — plus the matching background mode — keeps every
 // reminder/alarm working while letting the IPA be re-signed with a free account.
 //
-// This plugin runs after "expo-notifications" in app.json's plugins array, so
-// it always sees the entitlement that plugin just added.
+// Note: Expo runs mods in reverse plugin order, so this can run BEFORE
+// expo-notifications re-adds the entitlement. The ios-sideload workflow
+// therefore also strips it from the generated project after prebuild.
 
 const { withEntitlementsPlist, withInfoPlist } = require('@expo/config-plugins');
 

@@ -58,6 +58,33 @@ jobs:
       - name: Generate the iOS project
         run: npx expo prebuild --platform ios --clean
 
+      # Expo runs config-plugin mods in reverse order, so
+      # plugins/withLocalOnlyNotifications.js deletes aps-environment before
+      # expo-notifications writes it back. Strip it from the generated project
+      # here, where nothing can re-add it.
+      - name: Remove the push entitlement
+        run: |
+          set -euo pipefail
+          for f in ios/*/*.entitlements; do
+            [ -f "$f" ] || continue
+            /usr/libexec/PlistBuddy -c "Delete :aps-environment" "$f" 2>/dev/null || true
+            echo "Cleaned $f"
+          done
+          for f in ios/*/Info.plist; do
+            [ -f "$f" ] || continue
+            if /usr/libexec/PlistBuddy -c "Print :UIBackgroundModes" "$f" >/dev/null 2>&1; then
+              i=0
+              while /usr/libexec/PlistBuddy -c "Print :UIBackgroundModes:$i" "$f" >/dev/null 2>&1; do
+                if [ "$(/usr/libexec/PlistBuddy -c "Print :UIBackgroundModes:$i" "$f")" = "remote-notification" ]; then
+                  /usr/libexec/PlistBuddy -c "Delete :UIBackgroundModes:$i" "$f"
+                else
+                  i=$((i+1))
+                fi
+              done
+              echo "Cleaned background modes in $f"
+            fi
+          done
+
       - name: Check the build is free-account signable
         run: |
           set -euo pipefail
